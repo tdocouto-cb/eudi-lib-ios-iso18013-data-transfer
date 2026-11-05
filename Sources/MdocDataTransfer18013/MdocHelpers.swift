@@ -71,15 +71,20 @@ public class MdocHelpers {
 		docToSend: DeviceResponse
 	) async -> Result<(Data, Data), Error> {
 		do {
+			let cborToSend = docToSend.toCBOR(options: CBOROptions())
+			let clearBytesToSend = cborToSend.encode()
+			// Status-only messages must not consume a nonce for an unsent payload.
+			if status == .error {
+				let sd = SessionData(cipher_data: nil, status: 11)
+				return .success((Data(sd.encode(options: CBOROptions())), Data(clearBytesToSend)))
+			}
 			guard var sessionEncryption else {
 				logger.error("Session Encryption not initialized")
 				return .failure(Self.makeError(code: .sessionEncryptionNotInitialized))
 			}
-			if docToSend.documents == nil, status != .error { logger.error("Could not create documents to send") }
-			let cborToSend = docToSend.toCBOR(options: CBOROptions())
-			let clearBytesToSend = cborToSend.encode()
+			if docToSend.documents == nil { logger.error("Could not create documents to send") }
 			let cipherData = try await sessionEncryption.encrypt(clearBytesToSend)
-			let sd = SessionData(cipher_data: status == .error ? nil : cipherData, status: status == .error ? 11 : 20)
+			let sd = SessionData(cipher_data: cipherData, status: 20)
 			return .success((Data(sd.encode(options: CBOROptions())), Data(clearBytesToSend)))
 		} catch { return .failure(error) }
 	}
@@ -94,6 +99,7 @@ public class MdocHelpers {
 	///   - iaca: Root certificates trusted
 	///   - devicePrivateKeys: Device private keys
 	///   - dauthMethod: Method to perform mdoc authentication
+	///   - signatureAlgorithm: Device signature algorithm (defaults to ES256)
 	///   - handOver: handOver structure
 	/// - Returns: A ``DeviceRequest`` object
 
@@ -101,13 +107,15 @@ public class MdocHelpers {
 		deviceEngagement: DeviceEngagement?,
 		docs: [String: IssuerSigned],
 		docMetadata: [String: Data],
-		iaca: [x5chain],
+		trustValidator: (any CertificateTrustValidator),
 		requestData: Data,
 		privateKeyObjects: [String: CoseKeyPrivate],
 		dauthMethod: DeviceAuthMethod,
+		signatureAlgorithm: Cose.VerifyAlgorithm = .es256,
 		unlockData: [String: Data],
 		readerKeyRawData: [UInt8]?,
-		handOver: CBOR
+		handOver: CBOR,
+		authenticationContext: ThreadSafeAuthContext
 	) async -> Result<(
 		sessionEncryption: SessionEncryption,
 		deviceRequest: DeviceRequest,
@@ -131,7 +139,7 @@ public class MdocHelpers {
 				return .failure(Self.makeError(code: .deviceEngagementMissing))
 			}
 			// init session-encryption object from session establish message and device engagement, decrypt data
-			let sessionEncryption = SessionEncryption(se: se, de: deviceEngagement, handOver: handOver)
+			let sessionEncryption = SessionEncryption(se: se, de: deviceEngagement, handOver: handOver, authenticationContext: authenticationContext)
 			guard var sessionEncryption else {
 				logger.error("Session Encryption not initialized")
 				return .failure(Self.makeError(code: .sessionEncryptionNotInitialized))
@@ -147,7 +155,9 @@ public class MdocHelpers {
 				eReaderKey: sessionEncryption.sessionKeys.publicKey,
 				privateKeyObjects: privateKeyObjects,
 				dauthMethod: dauthMethod,
-				unlockData: unlockData
+				signatureAlgorithm: signatureAlgorithm,
+				unlockData: unlockData,
+				authenticationContext: authenticationContext
 			)
 			guard let (previewDeviceResponse, validRequestItems, _, _, _, _) = requestResponse else {
 				logger.error("Valid request items nil")
@@ -158,7 +168,8 @@ public class MdocHelpers {
 			var userRequestInfo = UserRequestInfo(
 				docDataFormats: requestedDocDataFormats,
 				itemsRequested: validRequestItems,
-				deviceRequestBytes: Data(requestData)
+				deviceRequestBytes: Data(requestData),
+				requestName: "BLE"
 			)
 			for docR in deviceRequest.docRequests {
 				let mdocAuth = MdocReaderAuthentication(transcript: sessionEncryption.sessionTranscript)
@@ -170,11 +181,11 @@ public class MdocHelpers {
 						let certificateIssuer = MdocHelpers.getCN(from: x509.subject.description)
 						do {
 							let itemsRequestRawData = docR.itemsRequestRawData!
-							let (isValidated, validationMessage) = try mdocAuth.validateReaderAuth(
+							let (isValidated, validationMessage) = try await mdocAuth.validateReaderAuth(
 								readerAuthCBOR: readerAuthRawCBOR,
 								readerAuthX5c: certData,
 								itemsRequestRawData: itemsRequestRawData,
-								rootIaca: iaca
+								trustValidator: trustValidator
 							)
 							readerValidation = ReaderAuthenticationResult(
 								isValidated: isValidated,
@@ -224,12 +235,13 @@ public class MdocHelpers {
 	/// - Parameters:
 	///   - deviceRequest: Device request coming from verifier
 	///   - issuerSigned: Map of document ID to issuerSigned cbor data
-	///   - selectedItems: Selected items from user (Map of Document ID to namespaced items)
+	///   - selectedItems: Selected items from user (Map of Document ID to namespaced items). An empty selection presents the document without data elements; nil resolves the verifier request.
 	///   - sessionEncryption: Session Encryption data structure
 	///   - eReaderKey: eReader (verifier) ephemeral public key
 	///   - devicePrivateKeys: Device Private keys
 	///   - sessionTranscript: Session Transcript object
 	///   - dauthMethod: Mdoc Authentication method
+	///   - signatureAlgorithm: Device signature algorithm (defaults to ES256)
 	/// - Returns: (Device response object, valid requested items, error request items) tuple
 	public static func getDeviceResponseToSend(
 		deviceRequest: DeviceRequest?,
@@ -241,10 +253,12 @@ public class MdocHelpers {
 		privateKeyObjects: [String: CoseKeyPrivate],
 		sessionTranscript: SessionTranscript? = nil,
 		dauthMethod: DeviceAuthMethod,
+		signatureAlgorithm: Cose.VerifyAlgorithm = .es256,
 		unlockData: [String: Data],
 		zkSpecsRequested: [DocType: [ZkSystemSpec]]? = nil,
 		zkSystemRepository: ZkSystemRepository? = nil,
-		deviceNameSpacesRequested: RequestDeviceNameSpaces? = nil
+		deviceNameSpacesRequested: RequestDeviceNameSpaces? = nil,
+		authenticationContext: ThreadSafeAuthContext
 	) async throws -> (
 		deviceResponse: DeviceResponse,
 		validRequestItems: RequestItems,
@@ -314,21 +328,13 @@ public class MdocHelpers {
 				nil
 			}
 			let reqNamespaces: [String] = if haveSelectedItems {
-				if !docSelectedItems!.isEmpty {
-					Array(docSelectedItems!.keys)
-				} else {
-					Array(issuerNs.nameSpaces.keys)
-				}
+				Array(docSelectedItems!.keys)
 			} else {
 				Array(docReq!.itemsRequest.requestNameSpaces.nameSpaces.keys)
 			}
 			for reqNamespace in reqNamespaces {
 				let reqElementIdentifiers: [String] = if haveSelectedItems {
-					if !docSelectedItems!.isEmpty {
-						Array(docSelectedItems![reqNamespace]!).map(\.elementIdentifier)
-					} else {
-						Array(issuerNs.nameSpaces[reqNamespace]!.map(\.elementIdentifier))
-					}
+					docSelectedItems![reqNamespace]!.map(\.elementIdentifier)
 				} else {
 					docReq!.itemsRequest.requestNameSpaces.nameSpaces[reqNamespace]!.elementIdentifiers
 				}
@@ -338,7 +344,7 @@ public class MdocHelpers {
 				}
 				var itemsReqSet = Set(reqElementIdentifiers)
 				if haveSelectedItems == false {
-					let simpleAgeAttestation = SimpleAgeAttest(namespaces: issuerNs.nameSpaces)
+					let simpleAgeAttestation = SimpleAgeAttest(namespaces: issuerNs.nameSpaces, namespace: reqNamespace)
 					let ageOverElementIdentifiers = IsoMdlModel.self.moreThan2AgeOverElementIdentifiers(
 						reqDocIdOrDocType,
 						reqNamespace,
@@ -374,18 +380,19 @@ public class MdocHelpers {
 				}
 			} // end ns for
 			let errors: Errors? = nsErrorsToAdd.isEmpty ? nil : Errors(errors: nsErrorsToAdd)
-			if nsItemsToAdd.count > 0 {
+			// A selection without elements presents the document with no data elements (OpenID4VP 1.0 section 6.4.1).
+			let presentsDocumentOnly = haveSelectedItems && docSelectedItems!.values.allSatisfy(\.isEmpty)
+			if nsItemsToAdd.count > 0 || presentsDocumentOnly {
 				let issuerAuthToAdd = documentToRespond.issuerAuth
-				let issuerNameSpacesToAdd = IssuerNameSpaces(nameSpaces: nsItemsToAdd)
 				let issuerSignedToAdd = IssuerSigned(
-					issuerNameSpaces: issuerNameSpacesToAdd,
+					issuerNameSpaces: nsItemsToAdd.isEmpty ? nil : IssuerNameSpaces(nameSpaces: nsItemsToAdd),
 					issuerAuth: issuerAuthToAdd
 				)
 				var devSignedToAdd: DeviceSigned? = nil
 				if let sessionTranscript, let privateKeyObject {
 					let deviceNameSpacesToAdd = deviceNameSpacesRequested?[reqDocIdOrDocType]
 					if let deviceNameSpacesToAdd {
-						let keyAuthorizations = issuerAuthToAdd.mso.deviceKeyInfo.keyAuthorizations					
+						let keyAuthorizations = issuerAuthToAdd.mso.deviceKeyInfo.keyAuthorizations
 						for (_, element) in deviceNameSpacesToAdd.deviceNameSpaces.enumerated() {
 							let namespace = element.key
 							let deviceSignedItems = element.value
@@ -415,8 +422,10 @@ public class MdocHelpers {
 					guard let devAuth = try await mdocAuth.getDeviceAuthForTransfer(
 						docType: documentToRespond.issuerAuth.mso.docType,
 						dauthMethod: dauthMethod,
+						signatureAlgorithm: signatureAlgorithm,
 						deviceNameSpaces: deviceNameSpacesToAdd,
 						unlockData: unlockPayload,
+						authenticationContext: authenticationContext,
 					) else {
 						logger.error("Cannot create device auth"); return nil
 					}
@@ -462,7 +471,7 @@ public class MdocHelpers {
 		return (deviceResponseToSend, validReqItemsDocDict, errorReqItemsDocDict, resMetadata, documentIds, zkpDocumentIds)
 	}
 
-	/// Prepares data blocks to be sent over BLE.	
+	/// Prepares data blocks to be sent over BLE.
 	static func prepareDataBlocksToSend(_ msg: Data, blockSize: Int) -> [Data] {
 		var sendBuffer = [Data]()
 		var numBlocks: Int = 0
@@ -714,7 +723,7 @@ public class MdocHelpers {
 			else { return nil }
 			let secureArea = SecureAreaRegistry.shared.get(name: docKeyInfo.secureAreaName)
 			let (_, curve) = try await secureArea.getInfoAndCurve(id: $0.key)
-			let coseKeyPrivate = try await CoseKeyPrivate(
+			let coseKeyPrivate = CoseKeyPrivate(
 				privateKeyId: $0.key,
 				index: keyIndex,
 				secureArea: secureArea,
